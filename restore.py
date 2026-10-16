@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Factory Desktop (v0.198.1+) Clean Uninstaller & Restorer
+Factory Desktop (v0.199.1+) Clean Uninstaller & Restorer
 Unloads LaunchAgent, stages APFS clone in /private/tmp, restores original app.asar, Info.plist, and bin/droid,
 re-signs inside-out, atomically swaps back into Factory.app, cleans up ~/.factory-zh, and restarts Factory.
 """

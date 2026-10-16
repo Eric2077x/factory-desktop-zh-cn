@@ -1,5 +1,5 @@
 /**
- * Factory Desktop (v0.198.1+) Hardened DOM & Attribute Localization Engine
+ * Factory Desktop (v0.199.1+) Hardened DOM & Attribute Localization Engine
  * 4-Pillar Security & Performance Standard:
  * 1. Security: Zero innerHTML/insertAdjacentHTML/eval/network; pure TextNode.data & safe attributes;
  *    preserves Electron contextIsolation: true.

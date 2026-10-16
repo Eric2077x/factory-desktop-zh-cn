@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Factory Desktop (v0.198.1+) Surgical ASAR Patcher + Integrity Sync + Entitlements Codesign
+ * Factory Desktop (v0.199.1+) Surgical ASAR Patcher + Integrity Sync + Entitlements Codesign
  * Compatible with both Node.js and Factory's bundled Bun runtime (`BUN_BE_BUN=1 .../bin/droid`).
  */
 'use strict';
@@ -118,7 +118,13 @@ const ENTITLEMENTS_XML = `<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 `;
 
-function acquireLock() {
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch (_) {}
+}
+
+function acquireLock(maxWaitMs = 15000) {
   fs.mkdirSync(BACKUP_DIR, { recursive: true, mode: 0o700 });
   chownToRealUser(PERSIST_DIR);
   // Clean up any legacy lock inside backup/ or repo dir
@@ -127,34 +133,39 @@ function acquireLock() {
     fs.rmSync(path.join(BASE_DIR, 'backup', '.patcher.lock'), { recursive: true, force: true });
   } catch (_) {}
 
-  try {
-    fs.mkdirSync(LOCK_DIR, { mode: 0o700 });
-    fs.writeFileSync(path.join(LOCK_DIR, 'pid'), String(process.pid), { encoding: 'utf8', mode: 0o600 });
-    chownToRealUser(LOCK_DIR);
-    return true;
-  } catch (err) {
-    if (err.code === 'EEXIST') {
-      try {
-        const pidStr = fs.readFileSync(path.join(LOCK_DIR, 'pid'), 'utf8').trim();
-        const pid = Number(pidStr);
-        if (pid > 0) {
-          process.kill(pid, 0);
-          return false; // Process is still alive
-        }
-      } catch (_) {
-        // Stale lock; reclaim
+  const deadline = Date.now() + maxWaitMs;
+  while (true) {
+    try {
+      fs.mkdirSync(LOCK_DIR, { mode: 0o700 });
+      fs.writeFileSync(path.join(LOCK_DIR, 'pid'), String(process.pid), { encoding: 'utf8', mode: 0o600 });
+      chownToRealUser(LOCK_DIR);
+      return true;
+    } catch (err) {
+      if (err.code === 'EEXIST') {
+        let holderAlive = false;
         try {
-          fs.rmSync(LOCK_DIR, { recursive: true, force: true });
-          fs.mkdirSync(LOCK_DIR, { mode: 0o700 });
-          fs.writeFileSync(path.join(LOCK_DIR, 'pid'), String(process.pid), { encoding: 'utf8', mode: 0o600 });
-          chownToRealUser(LOCK_DIR);
-          return true;
-        } catch (__) {
-          return false;
+          const pidStr = fs.readFileSync(path.join(LOCK_DIR, 'pid'), 'utf8').trim();
+          const pid = Number(pidStr);
+          if (pid > 0) {
+            process.kill(pid, 0);
+            holderAlive = true;
+          }
+        } catch (_) {
+          holderAlive = false;
+        }
+        if (!holderAlive) {
+          try {
+            fs.rmSync(LOCK_DIR, { recursive: true, force: true });
+            continue;
+          } catch (__) {}
+        }
+        if (Date.now() < deadline) {
+          sleepSync(200);
+          continue;
         }
       }
+      return false;
     }
-    return false;
   }
 }
 
@@ -233,6 +244,220 @@ function patchMainJs(src, roleMenus) {
       };
       Object.defineProperty(electron.Menu, "__factoryZhPatched", { value: true });
     }
+    if (process.platform === "darwin" && electron && electron.autoUpdater && !electron.autoUpdater.__factoryZhUpdaterPatched) {
+      const au = electron.autoUpdater;
+      const fs = require("fs");
+      const path = require("path");
+      const os = require("os");
+      const { execFile, spawn } = require("child_process");
+      const { promisify } = require("util");
+      const execFileAsync = promisify(execFile);
+
+      let feedUrl = "";
+      let feedHeaders = {};
+      let busy = false;
+      let stagedAppPath = "";
+      let stagedTmpDir = "";
+
+      const setFeed = function(opts) {
+        if (typeof opts === "string") {
+          feedUrl = opts;
+        } else if (opts && typeof opts === "object") {
+          feedUrl = opts.url || "";
+          feedHeaders = opts.headers || {};
+        }
+      };
+      const getFeed = function() {
+        return feedUrl;
+      };
+      const checkUpdates = async function() {
+        if (busy) return;
+        busy = true;
+        let tmpDir = "";
+        try {
+          au.emit("checking-for-update");
+          const url = feedUrl || ("https://downloads.factory.ai/factory-desktop/updates/darwin/" + process.arch + "/RELEASES.json");
+          const resp = await electron.net.fetch(url, {
+            headers: feedHeaders,
+            cache: "no-store"
+          });
+          if (!resp.ok) {
+            throw new Error("Update feed returned HTTP " + resp.status);
+          }
+          const feed = await resp.json();
+          const currentRelease = feed && typeof feed.currentRelease === "string" ? feed.currentRelease.trim() : "";
+          const appVer = electron.app.getVersion();
+          const releases = Array.isArray(feed && feed.releases) ? feed.releases : [];
+          const relEntry = releases.find(r => r && r.version === currentRelease) || releases[releases.length - 1];
+          const updateTo = (relEntry && relEntry.updateTo) || relEntry;
+
+          if (!currentRelease || currentRelease === appVer || !updateTo || !updateTo.url) {
+            busy = false;
+            au.emit("update-not-available");
+            return;
+          }
+
+          au.emit("update-available");
+
+          tmpDir = await fs.promises.mkdtemp(path.join("/private/tmp", "factory-zh-update-"));
+          const zipPath = path.join(tmpDir, "update.zip");
+          const extractDir = path.join(tmpDir, "extracted");
+          await fs.promises.mkdir(extractDir, { recursive: true, mode: 0o700 });
+
+          const dlResp = await electron.net.fetch(updateTo.url, {
+            headers: feedHeaders,
+            cache: "no-store"
+          });
+          if (!dlResp.ok || !dlResp.body) {
+            throw new Error("Failed to download update package (HTTP " + dlResp.status + ")");
+          }
+
+          const fh = await fs.promises.open(zipPath, "wx", 0o600);
+          const reader = dlResp.body.getReader();
+          try {
+            while (true) {
+              const step = await reader.read();
+              if (step.done) break;
+              await fh.writeFile(step.value);
+            }
+          } finally {
+            reader.releaseLock();
+            await fh.close();
+          }
+
+          await execFileAsync("/usr/bin/ditto", ["-x", "-k", zipPath, extractDir], {
+            maxBuffer: 16 * 1024 * 1024
+          });
+
+          const newApp = path.join(extractDir, "Factory.app");
+          if (!fs.existsSync(path.join(newApp, "Contents/Resources/app.asar"))) {
+            throw new Error("Extracted update does not contain a valid Factory.app bundle");
+          }
+
+          await execFileAsync("/usr/bin/codesign", ["--verify", "--deep", "--strict", newApp]);
+          const csInfo = await execFileAsync("/usr/bin/codesign", ["-dvv", newApp]);
+          const sigDetails = String(csInfo.stdout || "") + "\\n" + String(csInfo.stderr || "");
+          if (!sigDetails.includes("Developer ID Application:") || !sigDetails.includes("Identifier=com.electron.factory")) {
+            throw new Error("Downloaded update did not pass official Factory Developer ID signature verification");
+          }
+
+          const patcherScript = path.join(os.homedir(), ".factory-zh/engine/asar-patcher.js");
+          if (fs.existsSync(patcherScript)) {
+            const env = { ...process.env, FACTORY_APP_PATH: newApp };
+            const nodeCandidates = ["/opt/homebrew/bin/node", "/usr/local/bin/node"];
+            let runtimeBin = "";
+            for (const c of nodeCandidates) {
+              if (fs.existsSync(c)) {
+                runtimeBin = c;
+                break;
+              }
+            }
+            if (!runtimeBin) {
+              const bundledDroid = path.resolve(process.execPath, "../../Resources/bin/droid");
+              const homeDroid = path.join(os.homedir(), ".local/bin/droid");
+              if (fs.existsSync(bundledDroid)) {
+                runtimeBin = bundledDroid;
+                env.BUN_BE_BUN = "1";
+              } else if (fs.existsSync(homeDroid)) {
+                runtimeBin = homeDroid;
+                env.BUN_BE_BUN = "1";
+              } else {
+                runtimeBin = "node";
+              }
+            }
+            try {
+              await execFileAsync(runtimeBin, [patcherScript], {
+                env,
+                timeout: 120000,
+                maxBuffer: 16 * 1024 * 1024
+              });
+            } catch (_) {}
+          }
+
+          try {
+            await fs.promises.unlink(zipPath);
+          } catch (_) {}
+
+          if (stagedTmpDir && stagedTmpDir !== tmpDir) {
+            try {
+              await fs.promises.rm(stagedTmpDir, { recursive: true, force: true });
+            } catch (_) {}
+          }
+          stagedAppPath = newApp;
+          stagedTmpDir = tmpDir;
+          busy = false;
+
+          au.emit(
+            "update-downloaded",
+            {},
+            updateTo.notes || "",
+            updateTo.version || currentRelease,
+            new Date(updateTo.pub_date || Date.now()),
+            updateTo.url
+          );
+        } catch (err) {
+          busy = false;
+          if (tmpDir) {
+            try {
+              await fs.promises.rm(tmpDir, { recursive: true, force: true });
+            } catch (_) {}
+          }
+          au.emit("error", err instanceof Error ? err : new Error(String(err)));
+        }
+      };
+      const quitInstall = function() {
+        if (!stagedAppPath || !fs.existsSync(stagedAppPath)) {
+          au.emit("error", new Error("Staged update bundle not found"));
+          return;
+        }
+        au.emit("before-quit-for-update");
+        const targetApp = path.resolve(process.execPath, "../../..");
+        const pid = process.pid;
+        const cleanupDir = stagedTmpDir;
+        const staged = stagedAppPath;
+        const backupMove = path.join(cleanupDir, "Factory.app.prev");
+
+        const shScript = [
+          "i=0",
+          "while kill -0 " + pid + " 2>/dev/null && [ $i -lt 60 ]; do",
+          "  sleep 0.25",
+          "  i=$((i + 1))",
+          "done",
+          "sleep 0.3",
+          "/bin/rm -rf \\"$3\\" 2>/dev/null || true",
+          "if /bin/mv \\"$1\\" \\"$3\\" && /bin/mv \\"$2\\" \\"$1\\"; then",
+          "  /bin/rm -rf \\"$4\\" 2>/dev/null || true",
+          "  /usr/bin/open \\"$1\\"",
+          "else",
+          "  if [ ! -e \\"$1\\" ] && [ -e \\"$3\\" ]; then",
+          "    /bin/mv \\"$3\\" \\"$1\\" 2>/dev/null || true",
+          "  fi",
+          "  /usr/bin/open \\"$1\\" 2>/dev/null || true",
+          "fi"
+        ].join("\\n");
+
+        const child = spawn("/bin/sh", ["-c", shScript, "factory-zh-updater", targetApp, staged, backupMove, cleanupDir], {
+          detached: true,
+          stdio: "ignore"
+        });
+        child.unref();
+        electron.app.quit();
+      };
+
+      for (const [k, fn] of Object.entries({
+        setFeedURL: setFeed,
+        getFeedURL: getFeed,
+        checkForUpdates: checkUpdates,
+        quitAndInstall: quitInstall
+      })) {
+        try {
+          Object.defineProperty(au, k, { value: fn, configurable: true, writable: true });
+        } catch (_) {
+          try { au[k] = fn; } catch (__) {}
+        }
+      }
+      Object.defineProperty(au, "__factoryZhUpdaterPatched", { value: true });
+    }
   } catch (_) {}
 })();
 `;
@@ -246,10 +471,14 @@ function patchInitLifecycleJs(src, desktopBundle) {
   if (src.includes(MARKER_LIFECYCLE)) return src;
   let out = src;
 
-  // 1. Add ChineseSimplified to supported desktop locales array (variable-name-agnostic)
+  // 1. Add ChineseSimplified to supported desktop locales array (future-proof regardless of newly added languages or element order)
   out = out.replace(
-    /([\w$]+)=\[([\w$]+)\.English,\2\.Japanese,\2\.Korean,\2\.German\]/,
-    (_, arrVar, enumVar) => `${arrVar}=[${enumVar}.English,${enumVar}.ChineseSimplified,${enumVar}.Japanese,${enumVar}.Korean,${enumVar}.German]`
+    /=\[([^\]]*?([\w$]+)\.English\b)(?![^\]]*\.ChineseSimplified)/g,
+    (_, prefix, enumVar) => `=[${prefix},${enumVar}.ChineseSimplified`
+  );
+  out = out.replace(
+    /function ([\w$]+)\(\{saved:([\w$]+),candidates:([\w$]+)=\[\],supported:([\w$]+)\}\)\{/g,
+    'function $1({saved:$2="zh-CN",candidates:$3=[],supported:$4}){if(!$2)$2="zh-CN";'
   );
 
   // 2. Inject ChineseSimplified desktop resource bundle and set initial lng to "zh-CN"
@@ -259,8 +488,11 @@ function patchInitLifecycleJs(src, desktopBundle) {
     (_, mapVar, enumVar, enVar) => `${mapVar}={"zh-CN":{desktop:${desktopJson}},[${enumVar}.English]:${enVar},`
   );
   out = out.replace(
-    /\.init\(\{resources:([\w$]+),lng:([\w$]+),fallbackLng:\2,/,
-    (_, resVar, lngVar) => `.init({resources:${resVar},lng:"zh-CN",fallbackLng:${lngVar},`
+    /\.init\(\{resources:([\w$]+),lng:([\w$]+),fallbackLng:\2,(?:supportedLngs:\[([^\]]+)\],)?/,
+    (_, resVar, lngVar, supLngs) =>
+      supLngs
+        ? `.init({resources:${resVar},lng:"zh-CN",fallbackLng:${lngVar},supportedLngs:["zh-CN",${supLngs}],`
+        : `.init({resources:${resVar},lng:"zh-CN",fallbackLng:${lngVar},`
   );
 
   // 3. Force AppLocalization flag enabled in main process
@@ -280,10 +512,14 @@ function patchRendererIndexJs(src, zhLocaleData) {
   if (src.includes(MARKER_RENDERER)) return src;
   let out = src;
 
-  // 1. Add ChineseSimplified to supported renderer locales & Settings -> Language dropdown
+  // 1. Add ChineseSimplified to supported renderer locales & Settings -> Language dropdown (future-proof across any newly added languages or element order)
   out = out.replace(
-    /([\w$]+)=\[([\w$]+)\.English,\2\.Japanese,\2\.Korean,\2\.German\]/,
-    (_, arrVar, enumVar) => `${arrVar}=[${enumVar}.English,${enumVar}.ChineseSimplified,${enumVar}.Japanese,${enumVar}.Korean,${enumVar}.German]`
+    /=\[([^\]]*?([\w$]+)\.English\b)(?![^\]]*\.ChineseSimplified)/g,
+    (_, prefix, enumVar) => `=[${prefix},${enumVar}.ChineseSimplified`
+  );
+  out = out.replace(
+    /function ([\w$]+)\(\{saved:([\w$]+),candidates:([\w$]+)=\[\],supported:([\w$]+)\}\)\{/g,
+    'function $1({saved:$2="zh-CN",candidates:$3=[],supported:$4}){if(!$2)$2="zh-CN";'
   );
 
   // 2. Force AppLocalization feature flag enabled so Language selector in Preferences is always unlocked
@@ -314,8 +550,11 @@ function patchRendererIndexJs(src, zhLocaleData) {
   );
 
   out = out.replace(
-    /\.init\(\{resources:\{\[([\w$]+)\]:([\w$]+)\},lng:\1,fallbackLng:\1,/,
-    (_, enKeyVar, resVar) => `.init({resources:{[${enKeyVar}]:${resVar},"zh-CN":__factoryBuildZh(${resVar})},lng:"zh-CN",fallbackLng:${enKeyVar},`
+    /\.init\(\{resources:\{\[([\w$]+)\]:([\w$]+)\},lng:\1,fallbackLng:\1,(?:supportedLngs:\[([^\]]+)\],)?/,
+    (_, enKeyVar, resVar, supLngs) =>
+      supLngs
+        ? `.init({resources:{[${enKeyVar}]:${resVar},"zh-CN":__factoryBuildZh(${resVar})},lng:"zh-CN",fallbackLng:${enKeyVar},supportedLngs:["zh-CN",${supLngs}],`
+        : `.init({resources:{[${enKeyVar}]:${resVar},"zh-CN":__factoryBuildZh(${resVar})},lng:"zh-CN",fallbackLng:${enKeyVar},`
   );
 
   if (!out.includes('__factoryBuildZh(')) {
@@ -462,14 +701,32 @@ function verifyAsarBufferCompleteness(buf) {
   return { hStrlen, aligned, dataOffset, header };
 }
 
+function computePatchConfigHash() {
+  const h = crypto.createHash('sha256');
+  for (const rel of [
+    'engine/asar-patcher.js',
+    'engine/dom-translator.js',
+    'locales/zh-CN.json',
+    'locales/zh-desktop-i18n.json'
+  ]) {
+    const p = path.join(BASE_DIR, rel);
+    if (fs.existsSync(p)) {
+      h.update(fs.readFileSync(p));
+    }
+  }
+  return h.digest('hex');
+}
+
 function isAlreadyPatched() {
   if (!fs.existsSync(STATE_FILE) || !fs.existsSync(ASAR_PATH)) return false;
   try {
     const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     const currentHash = computeAsarHeaderHash(ASAR_PATH);
     const plistXml = fs.readFileSync(INFO_PLIST_PATH, 'utf8');
+    const configHash = computePatchConfigHash();
     return (
       state.patchedHeaderHash === currentHash &&
+      state.patchConfigHash === configHash &&
       plistXml.includes(currentHash)
     );
   } catch (_) {
@@ -491,6 +748,11 @@ function runPatch(options = {}) {
   }
 
   try {
+    if (!options.force && isAlreadyPatched()) {
+      console.log('[factory-zh] Already patched and verified (ASAR header hash matches state).');
+      return { status: 'already_patched' };
+    }
+
     const origBuf = fs.readFileSync(ASAR_PATH);
     const { dataOffset: oldDataOffset, header } = verifyAsarBufferCompleteness(origBuf);
 
@@ -511,8 +773,8 @@ function runPatch(options = {}) {
       fs.renameSync(backupAsarPath + '.tmp', backupAsarPath);
       fs.copyFileSync(INFO_PLIST_PATH, backupPlistPath + '.tmp');
       fs.renameSync(backupPlistPath + '.tmp', backupPlistPath);
-    } else if (options.force && fs.existsSync(backupAsarPath)) {
-      console.log('[factory-zh] Force re-patching from clean backup app.asar.orig...');
+    } else if (fs.existsSync(backupAsarPath)) {
+      console.log('[factory-zh] Re-patching from clean backup app.asar.orig...');
       const cleanBuf = fs.readFileSync(backupAsarPath);
       verifyAsarBufferCompleteness(cleanBuf);
       return runPatchFromBuffer(cleanBuf);
@@ -791,6 +1053,7 @@ function patchDroidBinaryInPlace(binaryPath, backupName) {
   const state = {
     patchedAt: new Date().toISOString(),
     patchedHeaderHash: newHeaderHash,
+    patchConfigHash: computePatchConfigHash(),
     lifecycleBundle: lifecycleKey,
     rendererBundle: rendererIndexKey
   };

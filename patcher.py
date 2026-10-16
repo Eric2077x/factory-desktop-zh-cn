@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Factory Desktop (v0.198.1+) Chinese Localization Patcher & LaunchAgent Installer
+Factory Desktop (v0.199.1+) Chinese Localization Patcher & LaunchAgent Installer
 Usage:
   python3 patcher.py             # Apply localization, persist runtime to ~/.factory-zh & install LaunchAgent
   python3 patcher.py --force     # Rebuild from clean backup & re-apply localization
@@ -76,7 +76,7 @@ PLIST_PATH = os.path.join(REAL_HOME, "Library", "LaunchAgents", f"{PLIST_LABEL}.
 
 GUARD_JS_CONTENT = """#!/usr/bin/env node
 /**
- * Factory Desktop (v0.198.1+) Auto-Heal Guard
+ * Factory Desktop (v0.199.1+) Auto-Heal Guard
  * Automatically generated into ~/.factory-zh/guard.js by patcher.py
  */
 'use strict';
